@@ -1,0 +1,1673 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Slice Ninja - three.js only</title>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js" crossorigin="anonymous"></script>
+<style>
+  * { -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden;
+    background: #0a0e17; touch-action: none;
+  }
+  #three-canvas { position: absolute; top: 0; left: 0; display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<!-- The entire game (world, HUD, menus, buttons, text, camera preview) is drawn into this one WebGL canvas by three.js. -->
+<canvas id="three-canvas"></canvas>
+
+<script>
+(function () {
+  const canvas = document.getElementById('three-canvas');
+  const ROUND_SECONDS = 60;
+
+  // Hidden video element: it is only the data source for MediaPipe and for a THREE.VideoTexture.
+  // It is never displayed; three.js draws the preview.
+  const inputVideo = document.createElement('video');
+  inputVideo.setAttribute('playsinline', '');
+  inputVideo.muted = true;
+  inputVideo.style.display = 'none';
+  document.body.appendChild(inputVideo);
+
+  let W, H, DPR;
+
+  // ================= three.js: game scene + HUD scene, one renderer =================
+  let renderer = null, scene = null, camera = null, hudScene = null, hudCamera = null;
+  const meshMap = new Map();
+  let objIdCounter = 0;
+
+  const CAM_DIST = 600;
+  const CAM_FOV = 50;
+  const REF_HEIGHT = 800;
+  let visibleHeight = 0;
+  let visibleWidthAtZ0 = 0;
+  let WORLD_SCALE = 1;
+
+  const raycaster = new THREE.Raycaster();
+  const zPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+
+  function resize() {
+    DPR = window.devicePixelRatio || 1;
+    W = window.innerWidth;
+    H = window.innerHeight;
+    if (renderer) resizeThree();
+  }
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', resize);
+
+  // ---------- tiny helpers ----------
+  function basicMat(color, opacity) {
+    return new THREE.MeshBasicMaterial({
+      color: color, transparent: true, opacity: opacity == null ? 1 : opacity,
+      depthTest: false, depthWrite: false, side: THREE.DoubleSide
+    });
+  }
+  function mk(geo, mat, order) {
+    const m = new THREE.Mesh(geo, mat);
+    m.renderOrder = order || 0;
+    m.frustumCulled = false;
+    return m;
+  }
+  function roundedRectShape(w, h, r) {
+    const x = -w / 2, y = -h / 2;
+    const s = new THREE.Shape();
+    s.moveTo(x + r, y);
+    s.lineTo(x + w - r, y);
+    s.quadraticCurveTo(x + w, y, x + w, y + r);
+    s.lineTo(x + w, y + h - r);
+    s.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    s.lineTo(x + r, y + h);
+    s.quadraticCurveTo(x, y + h, x, y + h - r);
+    s.lineTo(x, y + r);
+    s.quadraticCurveTo(x, y, x + r, y);
+    return s;
+  }
+  function arcPoints(cx, cy, r, a0, a1, n) {
+    const pts = [];
+    for (let i = 0; i <= n; i++) {
+      const a = a0 + (a1 - a0) * (i / n);
+      pts.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]);
+    }
+    return pts;
+  }
+
+  // ---------- stroke geometry (thick lines built from quads) ----------
+  function pushStroke(pos, idx, pts, half, ox, oy) {
+    for (let i = 0; i < pts.length - 1; i++) {
+      const ax = pts[i][0] + ox, ay = pts[i][1] + oy;
+      const bx = pts[i + 1][0] + ox, by = pts[i + 1][1] + oy;
+      let dx = bx - ax, dy = by - ay;
+      let len = Math.hypot(dx, dy);
+      if (len < 1e-6) { dx = 1; dy = 0; len = 1; }
+      const ux = dx / len, uy = dy / len;
+      const ex = ux * half, ey = uy * half;
+      const nx = -uy * half, ny = ux * half;
+      const base = pos.length / 3;
+      pos.push(
+        ax - ex + nx, ay - ey + ny, 0,
+        ax - ex - nx, ay - ey - ny, 0,
+        bx + ex + nx, by + ey + ny, 0,
+        bx + ex - nx, by + ey - ny, 0
+      );
+      idx.push(base, base + 1, base + 2, base + 1, base + 3, base + 2);
+    }
+  }
+  function makeGeometry(pos, idx) {
+    if (!pos.length) { pos.push(0, 0, 0, 0, 0, 0, 0, 0, 0); idx.push(0, 1, 2); }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    geo.setIndex(idx);
+    return geo;
+  }
+  function strokeGeometry(polys, thickness) {
+    const pos = [], idx = [];
+    polys.forEach(p => pushStroke(pos, idx, p, thickness / 2, 0, 0));
+    return makeGeometry(pos, idx);
+  }
+
+  // ================= text: a built-in vector stroke font, rendered as three.js meshes =================
+  // Glyphs live on a 0..w by 0..6 grid (cap height 6). Uppercase, digits and a little punctuation.
+  const G = (w, ...p) => ({ w: w, p: p });
+  const O_POLY = [[1, 0], [0, 1], [0, 5], [1, 6], [3, 6], [4, 5], [4, 1], [3, 0], [1, 0]];
+  const GLYPHS = {
+    ' ': G(2.5),
+    'A': G(4, [[0, 0], [2, 6], [4, 0]], [[0.8, 2.4], [3.2, 2.4]]),
+    'B': G(4, [[0, 0], [0, 6], [2.8, 6], [3.8, 5.2], [3.8, 3.8], [2.8, 3], [0, 3]], [[2.8, 3], [4, 2.2], [4, 0.8], [3, 0], [0, 0]]),
+    'C': G(4, [[4, 5], [3, 6], [1, 6], [0, 5], [0, 1], [1, 0], [3, 0], [4, 1]]),
+    'D': G(4, [[0, 0], [0, 6], [2.5, 6], [4, 4.5], [4, 1.5], [2.5, 0], [0, 0]]),
+    'E': G(4, [[4, 6], [0, 6], [0, 0], [4, 0]], [[0, 3], [3, 3]]),
+    'F': G(4, [[4, 6], [0, 6], [0, 0]], [[0, 3], [3, 3]]),
+    'G': G(4, [[4, 5], [3, 6], [1, 6], [0, 5], [0, 1], [1, 0], [3, 0], [4, 1], [4, 3], [2.2, 3]]),
+    'H': G(4, [[0, 0], [0, 6]], [[4, 0], [4, 6]], [[0, 3], [4, 3]]),
+    'I': G(2, [[0, 6], [2, 6]], [[1, 6], [1, 0]], [[0, 0], [2, 0]]),
+    'J': G(4, [[4, 6], [4, 1], [3, 0], [1, 0], [0, 1]]),
+    'K': G(4, [[0, 0], [0, 6]], [[4, 6], [0, 2.4]], [[1.3, 3.6], [4, 0]]),
+    'L': G(4, [[0, 6], [0, 0], [4, 0]]),
+    'M': G(5, [[0, 0], [0, 6], [2.5, 3.4], [5, 6], [5, 0]]),
+    'N': G(4, [[0, 0], [0, 6], [4, 0], [4, 6]]),
+    'O': G(4, O_POLY),
+    'P': G(4, [[0, 0], [0, 6], [3, 6], [4, 5], [4, 4], [3, 3], [0, 3]]),
+    'Q': G(4, O_POLY, [[2.6, 1.6], [4.2, -0.4]]),
+    'R': G(4, [[0, 0], [0, 6], [3, 6], [4, 5], [4, 4], [3, 3], [0, 3]], [[2, 3], [4, 0]]),
+    'S': G(4, [[4, 5], [3, 6], [1, 6], [0, 5], [0, 4], [1, 3], [3, 3], [4, 2], [4, 1], [3, 0], [1, 0], [0, 1]]),
+    'T': G(4, [[0, 6], [4, 6]], [[2, 6], [2, 0]]),
+    'U': G(4, [[0, 6], [0, 1], [1, 0], [3, 0], [4, 1], [4, 6]]),
+    'V': G(4, [[0, 6], [2, 0], [4, 6]]),
+    'W': G(5, [[0, 6], [1.2, 0], [2.5, 4], [3.8, 0], [5, 6]]),
+    'X': G(4, [[0, 6], [4, 0]], [[4, 6], [0, 0]]),
+    'Y': G(4, [[0, 6], [2, 3], [4, 6]], [[2, 3], [2, 0]]),
+    'Z': G(4, [[0, 6], [4, 6], [0, 0], [4, 0]]),
+    '0': G(4, O_POLY, [[0.9, 0.9], [3.1, 5.1]]),
+    '1': G(3, [[0, 4.5], [1.5, 6], [1.5, 0]], [[0, 0], [3, 0]]),
+    '2': G(4, [[0, 5], [1, 6], [3, 6], [4, 5], [4, 4], [0, 0], [4, 0]]),
+    '3': G(4, [[0, 5], [1, 6], [3, 6], [4, 5], [4, 4], [3, 3], [1.5, 3]], [[3, 3], [4, 2], [4, 1], [3, 0], [1, 0], [0, 1]]),
+    '4': G(4, [[3, 0], [3, 6], [0, 2], [4, 2]]),
+    '5': G(4, [[4, 6], [0, 6], [0, 3.2], [3, 3.2], [4, 2.4], [4, 1], [3, 0], [1, 0], [0, 1]]),
+    '6': G(4, [[3.5, 6], [1, 6], [0, 5], [0, 1], [1, 0], [3, 0], [4, 1], [4, 2], [3, 3], [0, 3]]),
+    '7': G(4, [[0, 6], [4, 6], [1.5, 0]]),
+    '8': G(4, [[1, 3], [0, 4], [0, 5], [1, 6], [3, 6], [4, 5], [4, 4], [3, 3], [1, 3], [0, 2], [0, 1], [1, 0], [3, 0], [4, 1], [4, 2], [3, 3]]),
+    '9': G(4, [[4, 3], [1, 3], [0, 4], [0, 5], [1, 6], [3, 6], [4, 5], [4, 1], [3, 0], [0.5, 0]]),
+    '+': G(4, [[0.5, 3], [3.5, 3]], [[2, 1.5], [2, 4.5]]),
+    '-': G(4, [[0.5, 3], [3.5, 3]]),
+    ':': G(1, [[0.5, 4], [0.5, 4.3]], [[0.5, 1.5], [0.5, 1.8]]),
+    '.': G(1, [[0.5, 0], [0.5, 0.3]]),
+    ',': G(1, [[0.5, 0.3], [0.1, -1.2]]),
+    '!': G(1, [[0.5, 6], [0.5, 2]], [[0.5, 0], [0.5, 0.3]]),
+    '?': G(4, [[0, 5], [1, 6], [3, 6], [4, 5], [4, 4], [2, 3], [2, 2]], [[2, 0], [2, 0.3]])
+  };
+  const GLYPH_H = 6;
+  const SPACING = 2.2;
+  const LINE_ADV = 10;
+  function glyphOf(ch) { return GLYPHS[ch] || GLYPHS[' ']; }
+  function lineWidth(s) {
+    let w = 0;
+    for (const ch of s) w += glyphOf(ch).w + SPACING;
+    return Math.max(0, w - SPACING);
+  }
+  function wrapText(str, maxG) {
+    const out = [];
+    str.split('\n').forEach(par => {
+      if (maxG == null) { out.push(par); return; }
+      let cur = '';
+      par.split(' ').forEach(word => {
+        const trial = cur ? cur + ' ' + word : word;
+        if (cur && lineWidth(trial) > maxG) { out.push(cur); cur = word; } else cur = trial;
+      });
+      out.push(cur);
+    });
+    return out;
+  }
+  function buildTextGeometry(lines, align, vAnchor, thickness) {
+    const pos = [], idx = [];
+    const half = thickness / 2;
+    const n = lines.length;
+    const totalH = GLYPH_H + (n - 1) * LINE_ADV;
+    const widths = lines.map(lineWidth);
+    const maxW = Math.max.apply(null, widths.concat([0]));
+    const yShift = vAnchor === 'top' ? -GLYPH_H : -(GLYPH_H - (n - 1) * LINE_ADV) / 2;
+    lines.forEach((line, li) => {
+      let x = align === 'center' ? -widths[li] / 2 : align === 'right' ? -widths[li] : 0;
+      const baseY = -li * LINE_ADV + yShift;
+      for (const ch of line) {
+        const g = glyphOf(ch);
+        g.p.forEach(poly => pushStroke(pos, idx, poly, half, x, baseY));
+        x += g.w + SPACING;
+      }
+    });
+    return { geometry: makeGeometry(pos, idx), width: maxW, height: totalH };
+  }
+
+  // Each label gets its own stencil ref, so overlapping strokes inside one label
+  // blend exactly once (no bright spots at joints, even while fading).
+  let stencilCounter = 0;
+  function nextStencilRef() {
+    stencilCounter++;
+    if (stencilCounter > 250) stencilCounter = 100; // HUD/menu labels use 1..99, popups recycle 100..250
+    return stencilCounter;
+  }
+
+  class TextLabel {
+    constructor(o) {
+      this.align = o.align || 'left';
+      this.vAnchor = o.vAnchor || 'middle';
+      this.thickness = o.thickness || 1.1;
+      this.key = null;
+      this.wG = 0; this.hG = GLYPH_H;
+      this.material = new THREE.MeshBasicMaterial({
+        color: o.color, transparent: true, opacity: o.opacity == null ? 1 : o.opacity,
+        depthTest: !!o.depthTest, depthWrite: false, side: THREE.DoubleSide,
+        stencilWrite: true, stencilRef: nextStencilRef(),
+        stencilFunc: THREE.NotEqualStencilFunc,
+        stencilFail: THREE.ReplaceStencilOp, stencilZFail: THREE.ReplaceStencilOp, stencilZPass: THREE.ReplaceStencilOp
+      });
+      this.mesh = new THREE.Mesh(makeGeometry([], []), this.material);
+      this.mesh.renderOrder = o.renderOrder || 0;
+      this.mesh.frustumCulled = false;
+      this.mesh.scale.setScalar((o.size || 12) / GLYPH_H);
+    }
+    get widthPx() { return this.wG * this.mesh.scale.x; }
+    get heightPx() { return this.hG * this.mesh.scale.x; }
+    set(str, maxWpx) {
+      const s = String(str).toUpperCase();
+      const key = s + '|' + (maxWpx == null ? '' : Math.round(maxWpx));
+      if (key === this.key) return;
+      this.key = key;
+      const lines = wrapText(s, maxWpx == null ? null : maxWpx / this.mesh.scale.x);
+      const built = buildTextGeometry(lines, this.align, this.vAnchor, this.thickness);
+      this.mesh.geometry.dispose();
+      this.mesh.geometry = built.geometry;
+      this.wG = built.width;
+      this.hG = built.height;
+    }
+    dispose() {
+      this.mesh.geometry.dispose();
+      this.material.dispose();
+    }
+  }
+
+  // ---------- scene setup ----------
+  function initThree() {
+    renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true, stencil: true });
+    renderer.setPixelRatio(DPR);
+    renderer.setClearColor(0x0a0e17, 1);
+    renderer.autoClear = false;
+    renderer.localClippingEnabled = true;
+
+    scene = new THREE.Scene();
+    camera = new THREE.PerspectiveCamera(CAM_FOV, W / H, 0.1, 3000);
+    camera.position.set(0, 0, CAM_DIST);
+    camera.lookAt(0, 0, 0);
+    scene.add(camera); // camera-attached children (background, flash, watermark) need the camera in the scene
+
+    scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+    const key = new THREE.DirectionalLight(0xffffff, 0.95);
+    key.position.set(-1, 1, 1.2);
+    scene.add(key);
+    const rim = new THREE.DirectionalLight(0x88aaff, 0.4);
+    rim.position.set(1, -0.6, -1);
+    scene.add(rim);
+
+    // HUD scene: orthographic camera measured in CSS pixels, origin at screen center
+    hudScene = new THREE.Scene();
+    hudCamera = new THREE.OrthographicCamera(-W / 2, W / 2, H / 2, -H / 2, 0.1, 200);
+    hudCamera.position.set(0, 0, 100);
+
+    initBackground();
+    initWatermark();
+    initFlash();
+    initTrail();
+    initHud();
+    initOverlays();
+    syncOverlays();
+    resizeThree();
+  }
+
+  function resizeThree() {
+    renderer.setPixelRatio(DPR);
+    renderer.setSize(W, H);
+    camera.aspect = W / H;
+    camera.updateProjectionMatrix();
+    const fovRad = (camera.fov * Math.PI) / 180;
+    visibleHeight = 2 * Math.tan(fovRad / 2) * camera.position.z;
+    visibleWidthAtZ0 = visibleHeight * camera.aspect;
+    WORLD_SCALE = visibleHeight / REF_HEIGHT;
+    updateBackgroundLayout();
+    updateFlashPlaneSize();
+    updateWatermarkLayout();
+
+    hudCamera.left = -W / 2; hudCamera.right = W / 2;
+    hudCamera.top = H / 2; hudCamera.bottom = -H / 2;
+    hudCamera.updateProjectionMatrix();
+    layoutHud();
+    layoutMenu();
+    layoutPause();
+  }
+
+  function screenToWorld(px, py) {
+    const rect = canvas.getBoundingClientRect();
+    const ndcX = (px / rect.width) * 2 - 1;
+    const ndcY = -(py / rect.height) * 2 + 1;
+    raycaster.setFromCamera({ x: ndcX, y: ndcY }, camera);
+    const out = new THREE.Vector3();
+    raycaster.ray.intersectPlane(zPlane, out);
+    return { x: out.x, y: out.y };
+  }
+  function landmarkToWorld(tipX, tipY) {
+    const ndcX = 1 - 2 * tipX;
+    const ndcY = 1 - 2 * tipY;
+    raycaster.setFromCamera({ x: ndcX, y: ndcY }, camera);
+    const out = new THREE.Vector3();
+    raycaster.ray.intersectPlane(zPlane, out);
+    return { x: out.x, y: out.y };
+  }
+
+  // ---- background: radial gradient drawn by a shader on a plane far behind the action ----
+  let bgMesh;
+  const BG_DIST = 1200;
+  function initBackground() {
+    const mat = new THREE.ShaderMaterial({
+      uniforms: { uAspect: { value: 1 } },
+      vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+      fragmentShader: [
+        'uniform float uAspect; varying vec2 vUv;',
+        'void main(){',
+        '  vec2 p = (vUv - vec2(0.5, 0.8)) * vec2(uAspect, 1.0);',
+        '  float R = length(vec2(0.5 * uAspect, 0.8));',
+        '  float t = clamp(length(p) / (0.7 * R), 0.0, 1.0);',
+        '  vec3 c0 = vec3(0.102, 0.129, 0.220);',
+        '  vec3 c1 = vec3(0.039, 0.055, 0.090);',
+        '  gl_FragColor = vec4(mix(c0, c1, t), 1.0);',
+        '}'
+      ].join('\n')
+    });
+    bgMesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), mat);
+    bgMesh.position.set(0, 0, -BG_DIST);
+    bgMesh.renderOrder = -20;
+    bgMesh.frustumCulled = false;
+    camera.add(bgMesh);
+  }
+  function updateBackgroundLayout() {
+    if (!bgMesh) return;
+    const fovRad = (camera.fov * Math.PI) / 180;
+    const h = 2 * BG_DIST * Math.tan(fovRad / 2) * 1.02;
+    bgMesh.scale.set(h * camera.aspect, h, 1);
+    bgMesh.material.uniforms.uAspect.value = camera.aspect;
+  }
+
+  // ---- fruit / bomb meshes ----
+  function makeFruitMesh(o) {
+    const r = o.r * 0.85;
+    let mesh;
+    const mainMat = new THREE.MeshStandardMaterial({ color: o.color, roughness: 0.45, metalness: 0.05 });
+    if (o.type === 'banana') {
+      mesh = new THREE.Mesh(new THREE.SphereGeometry(r, 18, 14), mainMat);
+      mesh.scale.set(1.5, 0.55, 0.7);
+    } else if (o.type === 'grape') {
+      mesh = new THREE.Group();
+      [[-0.4, -0.2], [0.3, -0.3], [0, 0.1], [-0.15, 0.5], [0.35, 0.4]].forEach(p => {
+        const m = new THREE.Mesh(new THREE.SphereGeometry(r * 0.45, 12, 10), mainMat.clone());
+        m.position.set(p[0] * r, p[1] * r, (Math.random() - 0.5) * r * 0.3);
+        mesh.add(m);
+      });
+    } else {
+      mesh = new THREE.Mesh(new THREE.SphereGeometry(r, 22, 18), mainMat);
+    }
+    if (o.type !== 'grape') {
+      const leaf = new THREE.Mesh(new THREE.ConeGeometry(r * 0.28, r * 0.55, 8), new THREE.MeshStandardMaterial({ color: 0x3ddc84 }));
+      leaf.position.set(r * 0.25, r * 1.05, 0);
+      leaf.rotation.z = -0.6;
+      mesh.add(leaf);
+      const stem = new THREE.Mesh(new THREE.CylinderGeometry(r * 0.06, r * 0.06, r * 0.35, 6), new THREE.MeshStandardMaterial({ color: 0x6b4423 }));
+      stem.position.set(0, r * 1.1, 0);
+      mesh.add(stem);
+    }
+    return mesh;
+  }
+
+  function makeBombMesh(o) {
+    const r = o.r * 0.85;
+    const group = new THREE.Group();
+    const body = new THREE.Mesh(new THREE.SphereGeometry(r, 22, 18), new THREE.MeshStandardMaterial({ color: 0x1c1c1c, roughness: 0.3, metalness: 0.65 }));
+    group.add(body);
+    const fuse = new THREE.Mesh(new THREE.CylinderGeometry(r * 0.08, r * 0.08, r * 0.6, 6), new THREE.MeshStandardMaterial({ color: 0xe8a33d }));
+    fuse.position.set(r * 0.2, r * 1.15, 0);
+    fuse.rotation.z = -0.5;
+    group.add(fuse);
+    const spark = new THREE.Mesh(new THREE.SphereGeometry(r * 0.15, 10, 8), new THREE.MeshStandardMaterial({ color: 0xffb020, emissive: 0xffb020, emissiveIntensity: 1.1 }));
+    spark.position.set(r * 0.42, r * 1.55, 0);
+    group.add(spark);
+    return group;
+  }
+
+  function getOrCreateMesh(o) {
+    if (o.__id === undefined) o.__id = objIdCounter++;
+    let mesh = meshMap.get(o.__id);
+    if (!mesh) {
+      mesh = o.type === 'bomb' ? makeBombMesh(o) : makeFruitMesh(o);
+      scene.add(mesh);
+      meshMap.set(o.__id, mesh);
+    }
+    return mesh;
+  }
+
+  function disposeMesh(mesh) {
+    mesh.traverse(c => {
+      if (c.geometry) c.geometry.dispose();
+      if (c.material) c.material.dispose();
+    });
+  }
+
+  function removeMesh(o) {
+    if (o.__id === undefined) return;
+    const mesh = meshMap.get(o.__id);
+    if (mesh) {
+      scene.remove(mesh);
+      disposeMesh(mesh);
+      meshMap.delete(o.__id);
+    }
+  }
+
+  function clearAllMeshes() {
+    meshMap.forEach(mesh => { scene.remove(mesh); disposeMesh(mesh); });
+    meshMap.clear();
+  }
+
+  function updatePieceClip(o, mesh) {
+    const A = o.rot + o.cutAngle;
+    const sign = -o.side;
+    const normal = new THREE.Vector3(sign * Math.cos(A), sign * Math.sin(A), 0);
+    const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(normal, new THREE.Vector3(o.x, o.y, 0));
+    mesh.traverse(c => { if (c.material) c.material.clippingPlanes = [plane]; });
+  }
+
+  // ---- slice trail ----
+  let trailGlowMesh, trailCoreMesh;
+  function initTrail() {
+    const glowMat = new THREE.MeshBasicMaterial({ color: 0x00fff5, transparent: true, opacity: 0.55, blending: THREE.AdditiveBlending, depthTest: false, depthWrite: false, side: THREE.DoubleSide });
+    const coreMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.95, depthTest: false, depthWrite: false, side: THREE.DoubleSide });
+    trailGlowMesh = new THREE.Mesh(new THREE.BufferGeometry(), glowMat);
+    trailCoreMesh = new THREE.Mesh(new THREE.BufferGeometry(), coreMat);
+    trailGlowMesh.renderOrder = 20;
+    trailCoreMesh.renderOrder = 21;
+    trailGlowMesh.visible = false;
+    trailCoreMesh.visible = false;
+    scene.add(trailGlowMesh);
+    scene.add(trailCoreMesh);
+  }
+  function hideTrail() {
+    if (trailGlowMesh) trailGlowMesh.visible = false;
+    if (trailCoreMesh) trailCoreMesh.visible = false;
+  }
+
+  // Chaikin corner cutting: turns the jagged polyline of trail samples into a smooth curve
+  function chaikin(points, iters) {
+    let pts = points;
+    for (let k = 0; k < iters; k++) {
+      if (pts.length < 3) break;
+      const out = [pts[0]];
+      for (let i = 0; i < pts.length - 1; i++) {
+        const a = pts[i], b = pts[i + 1];
+        out.push({ x: 0.75 * a.x + 0.25 * b.x, y: 0.75 * a.y + 0.25 * b.y });
+        out.push({ x: 0.25 * a.x + 0.75 * b.x, y: 0.25 * a.y + 0.75 * b.y });
+      }
+      out.push(pts[pts.length - 1]);
+      pts = out;
+    }
+    return pts;
+  }
+
+  // tail (index 0) is thin, head (last index) is full width
+  function buildRibbonGeometry(points, width) {
+    const n = points.length;
+    const positions = [];
+    for (let i = 0; i < n; i++) {
+      let dx, dy;
+      if (i === 0) { dx = points[1].x - points[0].x; dy = points[1].y - points[0].y; }
+      else if (i === n - 1) { dx = points[i].x - points[i - 1].x; dy = points[i].y - points[i - 1].y; }
+      else { dx = points[i + 1].x - points[i - 1].x; dy = points[i + 1].y - points[i - 1].y; }
+      const len = Math.hypot(dx, dy) || 1;
+      const px = -dy / len, py = dx / len;
+      const hw = (width / 2) * (0.12 + 0.88 * (i / (n - 1)));
+      positions.push(points[i].x + px * hw, points[i].y + py * hw, 0.06);
+      positions.push(points[i].x - px * hw, points[i].y - py * hw, 0.06);
+    }
+    const indices = [];
+    for (let i = 0; i < n - 1; i++) {
+      const a = i * 2, b = i * 2 + 1, c = (i + 1) * 2, d = (i + 1) * 2 + 1;
+      indices.push(a, b, c, b, d, c);
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geo.setIndex(indices);
+    return geo;
+  }
+
+  function updateTrailMesh(now) {
+    if (trail.length < 2) { hideTrail(); return; }
+    // drop near-duplicate samples (they would make zero-length ribbon segments), then smooth
+    const clean = [trail[0]];
+    for (let i = 1; i < trail.length; i++) {
+      const q = clean[clean.length - 1];
+      if (Math.hypot(trail[i].x - q.x, trail[i].y - q.y) > 0.01 * WORLD_SCALE) clean.push(trail[i]);
+    }
+    if (clean.length < 2) { hideTrail(); return; }
+    const pts = chaikin(clean, 3);
+    const hue = (now / 8) % 360;
+    trailGlowMesh.material.color.setHSL(hue / 360, 1, 0.6);
+    const glowW = 11 * WORLD_SCALE, coreW = 3.5 * WORLD_SCALE;
+    trailGlowMesh.geometry.dispose();
+    trailGlowMesh.geometry = buildRibbonGeometry(pts, glowW);
+    trailCoreMesh.geometry.dispose();
+    trailCoreMesh.geometry = buildRibbonGeometry(pts, coreW);
+    trailGlowMesh.visible = true;
+    trailCoreMesh.visible = true;
+  }
+
+  // ---- bomb-hit flash: a plane glued to the camera ----
+  let flashMesh;
+  const FLASH_DIST = 10;
+  function initFlash() {
+    const mat = new THREE.MeshBasicMaterial({ color: 0x460808, transparent: true, opacity: 0, depthTest: false, depthWrite: false });
+    flashMesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), mat);
+    flashMesh.position.set(0, 0, -FLASH_DIST);
+    flashMesh.renderOrder = 999;
+    camera.add(flashMesh);
+  }
+  function updateFlashPlaneSize() {
+    if (!flashMesh) return;
+    const fovRad = (camera.fov * Math.PI) / 180;
+    const h = 2 * FLASH_DIST * Math.tan(fovRad / 2) * 1.05;
+    const w = h * camera.aspect * 1.05;
+    flashMesh.geometry.dispose();
+    flashMesh.geometry = new THREE.PlaneGeometry(w, h);
+  }
+
+  // ---- big faded score watermark: stroke-font text glued behind the fruit plane ----
+  let watermarkLabel;
+  const WATERMARK_DIST = CAM_DIST + 20;
+  function initWatermark() {
+    watermarkLabel = new TextLabel({ size: 100, color: 0xc9cfdb, opacity: 0.14, align: 'center', vAnchor: 'middle', thickness: 1.9, depthTest: true, renderOrder: -10 });
+    watermarkLabel.set('000');
+    watermarkLabel.mesh.position.set(0, 0, -WATERMARK_DIST);
+    camera.add(watermarkLabel.mesh);
+  }
+  function updateWatermarkLayout() {
+    if (!watermarkLabel) return;
+    const fovRad = (camera.fov * Math.PI) / 180;
+    const visH = 2 * WATERMARK_DIST * Math.tan(fovRad / 2);
+    const visW = visH * camera.aspect;
+    const s = Math.min((0.34 * visH) / GLYPH_H, (0.92 * visW) / Math.max(1, watermarkLabel.wG));
+    watermarkLabel.mesh.scale.setScalar(s);
+    watermarkLabel.mesh.position.y = visH * 0.04;
+  }
+  function updateWatermarkText(text) {
+    watermarkLabel.set(text);
+    updateWatermarkLayout();
+  }
+
+  // ---- shared particle textures: generated numerically as DataTextures (no 2D canvas) ----
+  function makeDataTexture(size, pixelFn) {
+    const data = new Uint8Array(size * size * 4);
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const d = Math.hypot(x + 0.5 - size / 2, y + 0.5 - size / 2) / (size / 2);
+        const px = pixelFn(Math.min(1, d));
+        const i = (y * size + x) * 4;
+        data[i] = px[0]; data[i + 1] = px[1]; data[i + 2] = px[2]; data[i + 3] = Math.round(px[3] * 255);
+      }
+    }
+    const tex = new THREE.DataTexture(data, size, size, THREE.RGBAFormat);
+    tex.minFilter = THREE.LinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    tex.needsUpdate = true;
+    return tex;
+  }
+  function makeRadialTexture(innerAlpha, size) {
+    return makeDataTexture(size, d => [255, 255, 255, innerAlpha * (1 - d)]);
+  }
+  function makeSplashTexture(size) {
+    return makeDataTexture(size, d => {
+      if (d < 0.55) {
+        const u = d / 0.55;
+        return [180 + (90 - 180) * u, 20 + (10 - 20) * u, 20 + (10 - 20) * u, 0.9 + (0.55 - 0.9) * u];
+      }
+      const u = (d - 0.55) / 0.45;
+      return [90 + (10 - 90) * u, 10, 10 + (10 - 10) * u, 0.55 * (1 - u)];
+    });
+  }
+  const dotTexture = makeRadialTexture(1, 64);
+  const glowTexture = makeRadialTexture(0.9, 128);
+  const splashTexture = makeSplashTexture(128);
+
+  // ================= HUD (all three.js meshes in an orthographic scene) =================
+  const hud = {};
+  const menu = {};
+  const pause = {};
+  const buttons = [];
+  let previewOn = false;
+  let previewDot = null;
+  let paused = false;
+  let muted = false;
+
+  function makeCircleButton(radius, order, onClick) {
+    const group = new THREE.Group();
+    group.add(mk(new THREE.CircleGeometry(radius, 36), basicMat(0xffffff, 0.12), order));
+    return { group: group, hit: { type: 'circle', r: radius + 4 }, onClick: onClick };
+  }
+
+  function makeTextButton(text, o) {
+    const order = o.order;
+    const group = new THREE.Group();
+    const label = new TextLabel({ size: 13, color: o.primary ? 0xffffff : 0xf4f1ea, align: 'center', vAnchor: 'middle', thickness: 1.35, renderOrder: order + 3 });
+    label.set(text);
+    const h = 48;
+    const w = Math.max(o.minW || 0, label.widthPx + 68);
+    if (o.primary) {
+      const sh = mk(new THREE.ShapeGeometry(roundedRectShape(w, h, h / 2), 16), basicMat(0xe23b3b, 0.35), order);
+      sh.position.y = -5;
+      group.add(sh);
+    }
+    group.add(mk(new THREE.ShapeGeometry(roundedRectShape(w, h, h / 2), 16), basicMat(o.primary ? 0xee4444 : 0xffffff, o.primary ? 1 : 0.12), order + 1));
+    group.add(label.mesh);
+    return { group: group, w: w, h: h, hit: { type: 'rect', hw: w / 2 + 4, hh: h / 2 + 4 }, onClick: o.onClick };
+  }
+
+  function makeSpeakerIcon(order) {
+    const g = new THREE.Group();
+    const body = new THREE.Shape();
+    body.moveTo(-8, -3); body.lineTo(-8, 3); body.lineTo(-3, 3); body.lineTo(3, 8); body.lineTo(3, -8); body.lineTo(-3, -3); body.lineTo(-8, -3);
+    g.add(mk(new THREE.ShapeGeometry(body), basicMat(0xf4f1ea, 1), order));
+    const waves = mk(strokeGeometry([arcPoints(3, 0, 7, -0.9, 0.9, 10), arcPoints(3, 0, 11.5, -0.9, 0.9, 12)], 1.8), basicMat(0xf4f1ea, 1), order);
+    const cross = mk(strokeGeometry([[[8, -4.5], [15, 4.5]], [[8, 4.5], [15, -4.5]]], 1.9), basicMat(0xf4f1ea, 1), order);
+    g.add(waves); g.add(cross);
+    g.userData.waves = waves;
+    g.userData.cross = cross;
+    g.position.x = -3;
+    return g;
+  }
+  function updateMuteIcon() {
+    hud.muteIcon.userData.waves.visible = !muted;
+    hud.muteIcon.userData.cross.visible = muted;
+  }
+
+  function makePauseIcon(order) {
+    const g = new THREE.Group();
+    [-4.5, 4.5].forEach(x => {
+      const bar = mk(new THREE.PlaneGeometry(4, 15), basicMat(0xf4f1ea, 1), order);
+      bar.position.x = x;
+      g.add(bar);
+    });
+    return g;
+  }
+
+  function makeWatermelonIcon(order) {
+    const g = new THREE.Group();
+    const inner = new THREE.Group();
+    inner.scale.set(1.3, 1.3, 1);
+    inner.position.y = 10.4;
+    g.add(inner);
+    const half = (r, color, o) => inner.add(mk(new THREE.CircleGeometry(r, 40, Math.PI, Math.PI), basicMat(color, 1), o));
+    half(16, 0x3ddc84, order);
+    half(13.6, 0xeaf7d2, order + 0.1);
+    half(12, 0xff3b4e, order + 0.2);
+    [[-7, -4], [-3.5, -7.5], [0, -5], [3.5, -7.5], [7, -4]].forEach(p => {
+      const seed = mk(new THREE.CircleGeometry(1.5, 10), basicMat(0x111111, 1), order + 0.3);
+      seed.position.set(p[0], p[1], 0);
+      inner.add(seed);
+    });
+    return g;
+  }
+
+  function initHud() {
+    const L = 100;
+    const mkLabel = (size, color, align, thick) => new TextLabel({ size: size, color: color, align: align, vAnchor: 'top', thickness: thick, renderOrder: L });
+
+    hud.scoreLabel = mkLabel(9, 0x8f9bb3, 'left', 1.4);   hud.scoreLabel.set('SCORE');
+    hud.scoreValue = mkLabel(28, 0xffd23f, 'left', 1.2);  hud.scoreValue.set('0');
+    hud.timeLabel = mkLabel(8, 0x8f9bb3, 'center', 1.4);  hud.timeLabel.set('TIME');
+    hud.timeValue = mkLabel(22, 0xffb020, 'center', 1.2); hud.timeValue.set(String(ROUND_SECONDS));
+    hud.waveStatus = mkLabel(8, 0x6ee7a5, 'right', 1.45); hud.waveText = 'GET READY...';
+    hud.handStatus = mkLabel(10, 0xffb020, 'center', 1.35); hud.handText = null;
+    hud.handStatus.mesh.visible = false;
+    [hud.scoreLabel, hud.scoreValue, hud.timeLabel, hud.timeValue, hud.waveStatus, hud.handStatus].forEach(l => hudScene.add(l.mesh));
+
+    // wave timer bar (left edge is the geometry origin so scale.x shrinks it from the right)
+    const bgGeo = new THREE.PlaneGeometry(90, 6); bgGeo.translate(45, 0, 0);
+    hud.waveBg = mk(bgGeo, basicMat(0xffffff, 0.12), L);
+    const fillGeo = new THREE.PlaneGeometry(90, 6); fillGeo.translate(45, 0, 0);
+    fillGeo.setAttribute('color', new THREE.Float32BufferAttribute([0.24, 0.86, 0.52, 0.43, 0.91, 0.65, 0.24, 0.86, 0.52, 0.43, 0.91, 0.65], 3));
+    hud.waveFill = mk(fillGeo, new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, depthTest: false, depthWrite: false, side: THREE.DoubleSide }), L + 1);
+    hudScene.add(hud.waveBg);
+    hudScene.add(hud.waveFill);
+
+    // bottom-right buttons
+    hud.btnGroup = new THREE.Group();
+    hudScene.add(hud.btnGroup);
+    hud.mute = makeCircleButton(22, L + 1, () => { muted = !muted; updateMuteIcon(); });
+    hud.muteIcon = makeSpeakerIcon(L + 2);
+    hud.mute.group.add(hud.muteIcon);
+    updateMuteIcon();
+    hud.pause = makeCircleButton(22, L + 1, pauseGame);
+    hud.pause.group.add(makePauseIcon(L + 2));
+    hud.btnGroup.add(hud.mute.group);
+    hud.btnGroup.add(hud.pause.group);
+    buttons.push(hud.mute, hud.pause);
+
+    if (DEBUG) {
+      hud.debug = new TextLabel({ size: 9, color: 0xff8a00, align: 'center', vAnchor: 'top', thickness: 1.4, renderOrder: 150 });
+      hud.debug.set('FPS');
+      hudScene.add(hud.debug.mesh);
+    }
+
+    // camera preview: a THREE.VideoTexture plane + fingertip sprite, drawn by the same renderer
+    hud.preview = new THREE.Group();
+    hud.preview.visible = false;
+    hudScene.add(hud.preview);
+    hud.preview.add(mk(new THREE.PlaneGeometry(114, 84), basicMat(0xffffff, 0.25), L));
+    hud.preview.add(mk(new THREE.PlaneGeometry(110, 80), basicMat(0x000000, 1), L + 1));
+    const videoTexture = new THREE.VideoTexture(inputVideo);
+    videoTexture.minFilter = THREE.LinearFilter;
+    videoTexture.magFilter = THREE.LinearFilter;
+    const videoPlane = mk(new THREE.PlaneGeometry(110, 80), new THREE.MeshBasicMaterial({ map: videoTexture, transparent: true, depthTest: false, depthWrite: false, side: THREE.DoubleSide }), L + 2);
+    videoPlane.scale.x = -1; // selfie-style mirror
+    hud.preview.add(videoPlane);
+    previewDot = new THREE.Sprite(new THREE.SpriteMaterial({ map: dotTexture, color: 0xff3b4e, transparent: true, depthTest: false }));
+    previewDot.scale.set(14, 14, 1);
+    previewDot.position.z = 0.1;
+    previewDot.renderOrder = L + 3;
+    previewDot.visible = false;
+    videoPlane.add(previewDot); // child of the mirrored plane, so it mirrors too
+  }
+
+  function waveMaxW() { return Math.max(80, W / 2 - 20 - 50); }
+  function positionWaveBar() {
+    const top = H / 2 - 18;
+    const barTop = top - hud.waveStatus.heightPx - 8;
+    const left = W / 2 - 20 - 90;
+    hud.waveBg.position.set(left, barTop - 3, 0);
+    hud.waveFill.position.set(left, barTop - 3, 0);
+  }
+  function applyWaveStatus() {
+    hud.waveStatus.set(hud.waveText, waveMaxW());
+    positionWaveBar();
+  }
+  function setWaveStatus(text) { hud.waveText = text; applyWaveStatus(); }
+  function showHandStatus(text) {
+    hud.handText = text;
+    hud.handStatus.set(text, W - 40);
+    hud.handStatus.mesh.visible = true;
+  }
+  function hideHandStatus() { hud.handStatus.mesh.visible = false; }
+
+  function layoutHud() {
+    if (!hud.scoreLabel) return;
+    const pad = 20, top = H / 2 - 18;
+    hud.scoreLabel.mesh.position.set(-W / 2 + pad, top, 0);
+    hud.scoreValue.mesh.position.set(-W / 2 + pad, top - hud.scoreLabel.heightPx - 6, 0);
+    hud.timeLabel.mesh.position.set(0, top, 0);
+    hud.timeValue.mesh.position.set(0, top - hud.timeLabel.heightPx - 6, 0);
+    hud.waveStatus.mesh.position.set(W / 2 - pad, top, 0);
+    applyWaveStatus();
+    if (hud.handText) hud.handStatus.set(hud.handText, W - 40);
+    hud.handStatus.mesh.position.set(0, H / 2 - 78, 0);
+    const bx = W / 2 - 18 - 22;
+    hud.mute.group.position.set(bx, -H / 2 + 18 + 22, 0);
+    hud.pause.group.position.set(bx, -H / 2 + 72 + 22, 0);
+    hud.preview.position.set(-W / 2 + 18 + 57, -H / 2 + 18 + 42, 0);
+    if (hud.debug) hud.debug.mesh.position.set(0, -H / 2 + 60, 0);
+  }
+
+  // ---- stacked, auto-fitting overlay layout ----
+  function stack(group, items) {
+    let y = 0;
+    items.forEach((it, i) => {
+      it.obj.position.y = y - (it.centered ? it.h / 2 : 0);
+      y -= it.h + (i < items.length - 1 ? it.gap : 0);
+    });
+    const total = Math.max(1, -y);
+    const s = Math.min(1, (H - 24) / total);
+    group.scale.set(s, s, 1);
+    group.position.set(0, (s * total) / 2, 0);
+  }
+
+  const PARA_TEXT = 'SHOW YOUR HAND TO THE CAMERA. POINT WITH YOUR INDEX FINGER ONLY, FOLD THE OTHERS IN, AND SWIPE IT THROUGH THE AIR TO SLICE.';
+  const RULES = [
+    [0x3ddc84, 'GOOD FRUIT: +10 POINTS'],
+    [0xff3b4e, 'BOMB: -2 POINTS'],
+    [0x8f9bb3, 'A NEW WAVE OF 5 FRUIT + 3 BOMBS DROPS EVERY 5 SECONDS'],
+    [0xffd23f, 'SLICING ONLY COUNTS WHILE YOUR INDEX FINGER IS EXTENDED AND THE REST OF YOUR HAND IS FOLDED'],
+    [0xffb020, 'YOU HAVE ' + ROUND_SECONDS + ' SECONDS TO RACK UP POINTS BEFORE THE ROUND ENDS'],
+    [0x6ee7a5, 'TAP THE PAUSE BUTTON ANYTIME TO PAUSE, THEN RESUME OR QUIT']
+  ];
+
+  function initOverlays() {
+    // ---------- start / game-over menu ----------
+    let L = 200;
+    menu.group = new THREE.Group();
+    hudScene.add(menu.group);
+    menu.dim = mk(new THREE.PlaneGeometry(1, 1), basicMat(0x060910, 0.92), L);
+    menu.group.add(menu.dim);
+    menu.content = new THREE.Group();
+    menu.group.add(menu.content);
+
+    menu.icon = makeWatermelonIcon(L + 2);
+    menu.content.add(menu.icon);
+
+    menu.title = new TextLabel({ size: 26, color: 0xffd23f, align: 'center', vAnchor: 'top', thickness: 1.25, renderOrder: L + 2 });
+    menu.title.set('SLICE NINJA');
+    menu.content.add(menu.title.mesh);
+
+    menu.finalGroup = new THREE.Group();
+    menu.finalGroup.visible = false;
+    menu.finalLabel = new TextLabel({ size: 9, color: 0x8f9bb3, align: 'center', vAnchor: 'top', thickness: 1.4, renderOrder: L + 2 });
+    menu.finalLabel.set('FINAL SCORE');
+    menu.finalValue = new TextLabel({ size: 40, color: 0xffd23f, align: 'center', vAnchor: 'top', thickness: 1.2, renderOrder: L + 2 });
+    menu.finalValue.set('0');
+    menu.finalValue.mesh.position.y = -(menu.finalLabel.heightPx + 8);
+    menu.finalGroup.add(menu.finalLabel.mesh);
+    menu.finalGroup.add(menu.finalValue.mesh);
+    menu.finalH = menu.finalLabel.heightPx + 8 + menu.finalValue.heightPx;
+    menu.content.add(menu.finalGroup);
+
+    menu.para = new TextLabel({ size: 10, color: 0xa9b2c6, align: 'center', vAnchor: 'top', thickness: 1.3, renderOrder: L + 2 });
+    menu.content.add(menu.para.mesh);
+
+    menu.rows = RULES.map(r => {
+      const g = new THREE.Group();
+      const sw = mk(new THREE.ShapeGeometry(roundedRectShape(14, 14, 4), 8), basicMat(r[0], 1), L + 2);
+      sw.position.set(7, -7, 0);
+      const label = new TextLabel({ size: 9, color: 0xc7cede, align: 'left', vAnchor: 'top', thickness: 1.3, renderOrder: L + 2 });
+      label.mesh.position.set(22, -2.5, 0);
+      g.add(sw);
+      g.add(label.mesh);
+      menu.content.add(g);
+      return { group: g, label: label, text: r[1] };
+    });
+
+    menu.start = makeTextButton('START SLICING', { order: L + 2, primary: true, onClick: startGame });
+    menu.content.add(menu.start.group);
+    buttons.push(menu.start);
+
+    // ---------- pause overlay ----------
+    L = 300;
+    pause.group = new THREE.Group();
+    hudScene.add(pause.group);
+    pause.dim = mk(new THREE.PlaneGeometry(1, 1), basicMat(0x060910, 0.92), L);
+    pause.group.add(pause.dim);
+    pause.content = new THREE.Group();
+    pause.group.add(pause.content);
+    pause.title = new TextLabel({ size: 24, color: 0xffd23f, align: 'center', vAnchor: 'top', thickness: 1.25, renderOrder: L + 2 });
+    pause.title.set('PAUSED');
+    pause.scoreLabel = new TextLabel({ size: 9, color: 0x8f9bb3, align: 'center', vAnchor: 'top', thickness: 1.4, renderOrder: L + 2 });
+    pause.scoreLabel.set('SCORE');
+    pause.scoreValue = new TextLabel({ size: 40, color: 0xffd23f, align: 'center', vAnchor: 'top', thickness: 1.2, renderOrder: L + 2 });
+    pause.scoreValue.set('0');
+    pause.resume = makeTextButton('RESUME', { order: L + 2, primary: true, minW: 190, onClick: resumeGame });
+    pause.quit = makeTextButton('QUIT', { order: L + 2, primary: false, minW: 190, onClick: finishGame });
+    [pause.title.mesh, pause.scoreLabel.mesh, pause.scoreValue.mesh, pause.resume.group, pause.quit.group].forEach(o => pause.content.add(o));
+    buttons.push(pause.resume, pause.quit);
+  }
+
+  function layoutMenu() {
+    if (!menu.group) return;
+    menu.dim.scale.set(W, H, 1);
+    const cw = Math.min(320, W - 40);
+    const items = [];
+    items.push({ obj: menu.icon, h: 24, centered: true, gap: 10 });
+    items.push({ obj: menu.title.mesh, h: menu.title.heightPx, centered: false, gap: 12 });
+    if (menu.finalGroup.visible) items.push({ obj: menu.finalGroup, h: menu.finalH, centered: false, gap: 14 });
+    menu.para.set(PARA_TEXT, cw);
+    items.push({ obj: menu.para.mesh, h: menu.para.heightPx, centered: false, gap: 18 });
+    menu.rows.forEach(r => {
+      r.label.set(r.text, cw - 22);
+      r.group.position.x = -cw / 2;
+      items.push({ obj: r.group, h: Math.max(14, 2.5 + r.label.heightPx), centered: false, gap: 8 });
+    });
+    items[items.length - 1].gap = 22;
+    items.push({ obj: menu.start.group, h: menu.start.h, centered: true, gap: 0 });
+    stack(menu.content, items);
+  }
+
+  function layoutPause() {
+    if (!pause.group) return;
+    pause.dim.scale.set(W, H, 1);
+    stack(pause.content, [
+      { obj: pause.title.mesh, h: pause.title.heightPx, centered: false, gap: 16 },
+      { obj: pause.scoreLabel.mesh, h: pause.scoreLabel.heightPx, centered: false, gap: 6 },
+      { obj: pause.scoreValue.mesh, h: pause.scoreValue.heightPx, centered: false, gap: 26 },
+      { obj: pause.resume.group, h: pause.resume.h, centered: true, gap: 12 },
+      { obj: pause.quit.group, h: pause.quit.h, centered: true, gap: 0 }
+    ]);
+  }
+
+  function syncOverlays() {
+    menu.group.visible = !running && !paused;
+    pause.group.visible = paused;
+    hud.btnGroup.visible = running;
+    hud.preview.visible = running && previewOn;
+    if (!running) hideHandStatus();
+  }
+
+  // ---- HUD button hit-testing (works through group scale/position via worldToLocal) ----
+  const _hv = new THREE.Vector3();
+  function isChainVisible(o) {
+    while (o) { if (!o.visible) return false; o = o.parent; }
+    return true;
+  }
+  function hitButton(hx, hy) {
+    hudScene.updateMatrixWorld(true);
+    for (let i = buttons.length - 1; i >= 0; i--) {
+      const b = buttons[i];
+      if (!isChainVisible(b.group)) continue;
+      _hv.set(hx, hy, 0);
+      b.group.worldToLocal(_hv);
+      const inside = b.hit.type === 'circle'
+        ? Math.hypot(_hv.x, _hv.y) <= b.hit.r
+        : (Math.abs(_hv.x) <= b.hit.hw && Math.abs(_hv.y) <= b.hit.hh);
+      if (inside) return b;
+    }
+    return null;
+  }
+  function setBtnPressed(b, p) { b.group.scale.set(p ? 0.94 : 1, p ? 0.94 : 1, 1); }
+
+  // ================= game state =================
+  const GOOD_OBJECTS = [
+    { type: 'apple', color: '#e6423f', r: 30 },
+    { type: 'orange', color: '#f2932b', r: 30 },
+    { type: 'grape', color: '#8b5cf6', r: 30 },
+    { type: 'watermelon', color: '#3ddc84', r: 36 },
+    { type: 'banana', color: '#f5d547', r: 28 },
+    { type: 'strawberry', color: '#e94477', r: 26 },
+    { type: 'kiwi', color: '#a3c644', r: 26 },
+    { type: 'pineapple', color: '#e8b93b', r: 34 }
+  ];
+  const BAD_OBJECTS = [
+    { type: 'bomb', color: '#1c1c1c', r: 30 }
+  ];
+  const NEON_COLORS = [0x00fff5, 0xff00e5, 0x39ff14, 0xfffb00, 0xff8a00, 0x00b3ff];
+  function pickNeonColor() { return NEON_COLORS[Math.floor(Math.random() * NEON_COLORS.length)]; }
+  function pickRandom(arr, n) {
+    const picks = [];
+    for (let i = 0; i < n; i++) picks.push(arr[Math.floor(Math.random() * arr.length)]);
+    return picks;
+  }
+
+  // ---- audio (Web Audio API, no files needed) ----
+  let audioCtx = null;
+  let musicTimer = null;
+  let musicStep = 0;
+
+  function ensureAudio() {
+    if (!audioCtx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) audioCtx = new AC();
+    }
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+  }
+  function tone(freq, dur, type, vol, delay) {
+    if (muted || !audioCtx) return;
+    const t0 = audioCtx.currentTime + (delay || 0);
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type || 'sine';
+    osc.frequency.setValueAtTime(freq, t0);
+    gain.gain.setValueAtTime(0, t0);
+    gain.gain.linearRampToValueAtTime(vol, t0 + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    osc.connect(gain).connect(audioCtx.destination);
+    osc.start(t0);
+    osc.stop(t0 + dur + 0.05);
+  }
+  function noiseBurst(dur, vol, delay) {
+    if (muted || !audioCtx) return;
+    const t0 = audioCtx.currentTime + (delay || 0);
+    const bufferSize = audioCtx.sampleRate * dur;
+    const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < bufferSize; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / bufferSize);
+    const src = audioCtx.createBufferSource();
+    src.buffer = buffer;
+    const gain = audioCtx.createGain();
+    gain.gain.setValueAtTime(vol, t0);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    const filter = audioCtx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.setValueAtTime(700, t0);
+    src.connect(filter).connect(gain).connect(audioCtx.destination);
+    src.start(t0);
+  }
+  function playSwish() { tone(900, 0.12, 'triangle', 0.05); tone(500, 0.1, 'triangle', 0.04, 0.02); }
+  function playGoodHit() { tone(880, 0.18, 'sine', 0.09); tone(1320, 0.22, 'sine', 0.06, 0.05); }
+  function playBombHit() {
+    tone(90, 0.5, 'square', 0.12);
+    tone(55, 0.7, 'sawtooth', 0.08, 0.05);
+    noiseBurst(0.5, 0.18, 0);
+  }
+  const SCALE = [261.6, 293.7, 329.6, 392.0, 440.0, 523.3, 587.3];
+  function musicStepFn() {
+    if (!running || muted || awaitingCamera) return;
+    const note = SCALE[Math.floor(Math.random() * SCALE.length)];
+    tone(note, 0.5, 'triangle', 0.035);
+    if (musicStep % 4 === 0) tone(note / 2, 0.6, 'sine', 0.025);
+    musicStep++;
+  }
+  function startMusic() {
+    ensureAudio();
+    if (musicTimer) clearInterval(musicTimer);
+    musicStep = 0;
+    musicTimer = setInterval(musicStepFn, 420);
+  }
+  function stopMusic() {
+    if (musicTimer) clearInterval(musicTimer);
+    musicTimer = null;
+  }
+
+  let objects = [];
+  let particles = [];
+  let score = 0;
+  let running = false;
+  let waveTimer = 0;
+  let timeRemaining = ROUND_SECONDS * 1000;
+  let lastSecsShown = ROUND_SECONDS;
+  const WAVE_INTERVAL = 5000;
+
+  function setScore(v) {
+    hud.scoreValue.set(String(v));
+    const text = v < 0 ? '-' + String(Math.abs(v)).padStart(2, '0') : String(v).padStart(3, '0');
+    updateWatermarkText(text);
+  }
+
+  function spawnWave() {
+    const good = pickRandom(GOOD_OBJECTS, 5);
+    const bad = pickRandom(BAD_OBJECTS, 3);
+    const batch = good.map(o => ({ ...o, good: true })).concat(bad.map(o => ({ ...o, good: false })));
+    batch.forEach((o, i) => {
+      setTimeout(() => { if (running) launchObject(o); }, i * 120);
+    });
+    setWaveStatus('WAVE INCOMING: 5 FRUIT + 3 BOMBS');
+  }
+
+  function launchObject(o) {
+    const margin = 60 * WORLD_SCALE;
+    const x = -visibleWidthAtZ0 / 2 + margin + Math.random() * (visibleWidthAtZ0 - margin * 2);
+    const vy = visibleHeight * 0.014 + Math.random() * 2.4 * WORLD_SCALE;
+    const vx = (Math.random() - 0.5) * 2.4 * WORLD_SCALE;
+    const r = o.r * WORLD_SCALE;
+    objects.push({
+      type: o.type, color: o.color, r, good: o.good,
+      x, y: -visibleHeight / 2 - r,
+      vx, vy,
+      gravity: (0.09 + Math.random() * 0.014) * WORLD_SCALE,
+      rot: Math.random() * Math.PI * 2,
+      vrot: (Math.random() - 0.5) * 0.06,
+      sliced: false,
+      alive: true
+    });
+  }
+
+  // popups are stroke-font text meshes in the game scene
+  function popup(x, y, text, color) {
+    const label = new TextLabel({ size: 24 * WORLD_SCALE, color: color, align: 'center', vAnchor: 'middle', thickness: 1.6, renderOrder: 30 });
+    label.set(text);
+    label.mesh.position.set(x, y, 0.08);
+    scene.add(label.mesh);
+    particles.push({ sprite: label.mesh, label: label, x, y, vx: 0, vy: 1.4 * WORLD_SCALE, life: 1, decay: 0.02, kind: 'text' });
+  }
+
+  function disposeParticle(p) {
+    scene.remove(p.sprite);
+    if (p.label) p.label.dispose();
+    else p.sprite.material.dispose();
+  }
+
+  function addGlow(x, y, color) {
+    const mat = new THREE.SpriteMaterial({ map: glowTexture, color, transparent: true, opacity: 1, blending: THREE.AdditiveBlending, depthTest: false });
+    const spr = new THREE.Sprite(mat);
+    const base = 10 * WORLD_SCALE;
+    spr.scale.set(base, base, 1);
+    spr.position.set(x, y, 0.05);
+    scene.add(spr);
+    particles.push({ sprite: spr, x, y, vx: 0, vy: 0, life: 1, decay: 0.045, kind: 'glow', grow: true, baseScale: base, growAmount: 90 * WORLD_SCALE });
+
+    for (let i = 0; i < 8; i++) {
+      const ang = Math.random() * Math.PI * 2;
+      const speed = (1 + Math.random() * 2.5) * WORLD_SCALE;
+      const smat = new THREE.SpriteMaterial({ map: dotTexture, color, transparent: true, opacity: 1, blending: THREE.AdditiveBlending, depthTest: false });
+      const sspr = new THREE.Sprite(smat);
+      const s = 5 * WORLD_SCALE;
+      sspr.scale.set(s, s, 1);
+      sspr.position.set(x, y, 0.05);
+      scene.add(sspr);
+      particles.push({ sprite: sspr, x, y, vx: Math.cos(ang) * speed, vy: Math.sin(ang) * speed, life: 1, decay: 0.02, kind: 'spark' });
+    }
+  }
+
+  function addBombSplash(x, y) {
+    const mat = new THREE.SpriteMaterial({ map: splashTexture, transparent: true, opacity: 1, depthTest: false });
+    const spr = new THREE.Sprite(mat);
+    const base = 12 * WORLD_SCALE;
+    spr.scale.set(base, base, 1);
+    spr.position.set(x, y, 0.04);
+    scene.add(spr);
+    particles.push({ sprite: spr, x, y, vx: 0, vy: 0, life: 1, decay: 0.045, kind: 'splash', grow: true, baseScale: base, growAmount: 110 * WORLD_SCALE });
+
+    for (let i = 0; i < 12; i++) {
+      const ang = Math.random() * Math.PI * 2;
+      const speed = (1 + Math.random() * 3.5) * WORLD_SCALE;
+      const color = Math.random() > 0.5 ? 0x8a0f0f : 0x1a1a1a;
+      const cmat = new THREE.SpriteMaterial({ map: dotTexture, color, transparent: true, opacity: 1, depthTest: false });
+      const cspr = new THREE.Sprite(cmat);
+      const s = 7 * WORLD_SCALE;
+      cspr.scale.set(s, s, 1);
+      cspr.position.set(x, y, 0.04);
+      scene.add(cspr);
+      particles.push({ sprite: cspr, x, y, vx: Math.cos(ang) * speed, vy: Math.sin(ang) * speed - 0.5 * WORLD_SCALE, life: 1, decay: 0.02, kind: 'chunk' });
+    }
+  }
+
+  let timeScale = 1;
+  let flashAlpha = 0;
+  function triggerSlowMotion() { flashAlpha = 0.55; }
+
+  // ---- slicing: pure world-space collision ----
+  let trail = [];
+  let pointerDown = false;
+
+  function segCircleHit(p1, p2, cx, cy, r) {
+    const dx = p2.x - p1.x, dy = p2.y - p1.y;
+    const len2 = dx * dx + dy * dy;
+    if (len2 === 0) {
+      const ddx = p1.x - cx, ddy = p1.y - cy;
+      return Math.sqrt(ddx * ddx + ddy * ddy) <= r;
+    }
+    let t = ((cx - p1.x) * dx + (cy - p1.y) * dy) / len2;
+    t = Math.max(0, Math.min(1, t));
+    const px = p1.x + t * dx, py = p1.y + t * dy;
+    const ddx = px - cx, ddy = py - cy;
+    return Math.sqrt(ddx * ddx + ddy * ddy) <= r;
+  }
+
+  function checkSlices(p1, p2) {
+    if (!p1 || !p2) return;
+    for (const o of objects) {
+      if (!o.alive || o.sliced || o.isPiece) continue;
+      if (segCircleHit(p1, p2, o.x, o.y, o.r * 1.15)) sliceObject(o, p1, p2);
+    }
+  }
+
+  function sliceObject(o, p1, p2) {
+    o.sliced = true;
+    o.alive = false;
+    if (o.good) {
+      score += 10;
+      popup(o.x, o.y, '+10', '#3ddc84');
+      addGlow(o.x, o.y, pickNeonColor());
+      playGoodHit();
+    } else {
+      score -= 2;
+      popup(o.x, o.y, '-2', '#ff3b4e');
+      addBombSplash(o.x, o.y);
+      triggerSlowMotion();
+      playBombHit();
+    }
+    playSwish();
+    setScore(score);
+    spawnPieces(o, p1, p2);
+  }
+
+  function spawnPieces(o, p1, p2) {
+    const dx = p2.x - p1.x, dy = p2.y - p1.y;
+    const theta = (dx === 0 && dy === 0) ? 0 : Math.atan2(dy, dx);
+    const localCut = theta - o.rot;
+    const perp = theta + Math.PI / 2;
+    const speed = (2.5 + Math.random() * 2) * WORLD_SCALE;
+
+    [1, -1].forEach(sign => {
+      objects.push({
+        type: o.type, color: o.color, r: o.r, good: o.good,
+        isPiece: true, side: sign, cutAngle: localCut,
+        x: o.x, y: o.y,
+        vx: o.vx + Math.cos(perp) * speed * sign,
+        vy: o.vy + Math.sin(perp) * speed * sign + 1.5 * WORLD_SCALE,
+        gravity: o.gravity,
+        rot: o.rot,
+        vrot: o.vrot + sign * 0.12,
+        sliced: true,
+        alive: true
+      });
+    });
+  }
+
+  // ---- pointer input: HUD buttons (any pointer) + touch slicing ----
+  let activePointerId = null;
+  let pressedBtn = null, pressedPointer = null;
+  function hudPoint(e) {
+    const rect = canvas.getBoundingClientRect();
+    return { x: e.clientX - rect.left - W / 2, y: H / 2 - (e.clientY - rect.top) };
+  }
+  function onDown(e) {
+    const hp = hudPoint(e);
+    const b = hitButton(hp.x, hp.y);
+    if (b) {
+      pressedBtn = b; pressedPointer = e.pointerId;
+      setBtnPressed(b, true);
+      try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+      e.preventDefault();
+      return;
+    }
+    if (!running) return;
+    if (e.pointerType === 'mouse') return;
+    if (activePointerId !== null) return;
+    activePointerId = e.pointerId;
+    pointerDown = true;
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    const rect = canvas.getBoundingClientRect();
+    const p = screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
+    trail = [p];
+    checkSlices(p, p);
+    e.preventDefault();
+  }
+  function onMove(e) {
+    if (e.pointerType === 'mouse' && !pressedBtn) {
+      const hp = hudPoint(e);
+      canvas.style.cursor = hitButton(hp.x, hp.y) ? 'pointer' : 'default';
+    }
+    if (!running || !pointerDown || e.pointerId !== activePointerId) return;
+    const rect = canvas.getBoundingClientRect();
+    const points = (e.getCoalescedEvents && e.getCoalescedEvents()) || [e];
+    points.forEach(ev => {
+      const p = screenToWorld(ev.clientX - rect.left, ev.clientY - rect.top);
+      const prev = trail[trail.length - 1];
+      trail.push(p);
+      if (trail.length > 18) trail.shift();
+      checkSlices(prev, p);
+    });
+    e.preventDefault();
+  }
+  function onUp(e) {
+    if (pressedBtn && e.pointerId === pressedPointer) {
+      const b = pressedBtn;
+      pressedBtn = null; pressedPointer = null;
+      setBtnPressed(b, false);
+      if (e.type === 'pointerup') {
+        const hp = hudPoint(e);
+        if (hitButton(hp.x, hp.y) === b) b.onClick();
+      }
+      return;
+    }
+    if (e.pointerId !== activePointerId) return;
+    activePointerId = null;
+    pointerDown = false;
+    trail = [];
+  }
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', onUp);
+  canvas.addEventListener('pointerleave', onUp);
+
+  // ---- hand tracking ----
+  const FINGER_JOINTS = {
+    index: { tip: 8, pip: 6 }, middle: { tip: 12, pip: 10 },
+    ring: { tip: 16, pip: 14 }, pinky: { tip: 20, pip: 18 }
+  };
+  function isFingerExtended(lm, joints) { return lm[joints.tip].y < lm[joints.pip].y - 0.02; }
+  function isIndexOnlyPose(lm) {
+    return isFingerExtended(lm, FINGER_JOINTS.index) &&
+      !isFingerExtended(lm, FINGER_JOINTS.middle) &&
+      !isFingerExtended(lm, FINGER_JOINTS.ring) &&
+      !isFingerExtended(lm, FINGER_JOINTS.pinky);
+  }
+
+  let hands = null;
+  let cameraHelper = null;
+  let handDown = false;
+  let smoothPt = null;
+
+  class OneEuroFilter {
+    constructor(minCutoff, beta, dCutoff) { this.minCutoff = minCutoff; this.beta = beta; this.dCutoff = dCutoff; this.reset(); }
+    reset() { this.xPrev = null; this.dxPrev = 0; this.tPrev = null; }
+    alpha(cutoff, dt) { const tau = 1 / (2 * Math.PI * cutoff); return 1 / (1 + tau / dt); }
+    filter(x, t) {
+      if (this.tPrev === null) { this.tPrev = t; this.xPrev = x; return x; }
+      const dt = Math.max((t - this.tPrev) / 1000, 1 / 120);
+      this.tPrev = t;
+      const dx = (x - this.xPrev) / dt;
+      const aD = this.alpha(this.dCutoff, dt);
+      const edx = this.dxPrev + aD * (dx - this.dxPrev);
+      this.dxPrev = edx;
+      const cutoff = this.minCutoff + this.beta * Math.abs(edx);
+      const a = this.alpha(cutoff, dt);
+      const filtered = this.xPrev + a * (x - this.xPrev);
+      this.xPrev = filtered;
+      return filtered;
+    }
+  }
+  // HAND_SMOOTHING: 0 = raw tracking, 1 = very smooth (more lag). 0.9 is very smooth; drop toward 0.75 if it feels laggy.
+  // The One Euro filter smooths hard when the finger is slow (kills jitter) and relaxes
+  // when it moves fast (so quick swipes still feel responsive).
+  const HAND_SMOOTHING = 0.9;
+  const RENDER_FOLLOW = 1 - 0.7 * HAND_SMOOTHING; // per-frame follow factor for the on-screen cursor
+  const tipFilterX = new OneEuroFilter(6 * Math.pow(0.05, HAND_SMOOTHING), 10, 1.0);
+  const tipFilterY = new OneEuroFilter(6 * Math.pow(0.05, HAND_SMOOTHING), 10, 1.0);
+
+  // A 1-3 frame flicker in pose detection or tracking shouldn't break the slice, so ride through it.
+  const POSE_GRACE_FRAMES = 3;
+  let poseMiss = 0, lostFrames = 0;
+  let handSlicing = false, handPresent = false;
+  let lastRawPoint = null, lastRawTime = 0;
+  let handVX = 0, handVY = 0;
+  const MAX_EXTRAPOLATE_MS = 120;
+
+  function onHandResults(results) {
+    const lm = results.multiHandLandmarks && results.multiHandLandmarks[0];
+    let slicingPose = false;
+
+    if (lm) {
+      const rawPose = isIndexOnlyPose(lm);
+      poseMiss = rawPose ? 0 : poseMiss + 1;
+      lostFrames = 0;
+      slicingPose = rawPose || (handSlicing && poseMiss <= POSE_GRACE_FRAMES);
+      const rawTip = lm[8];
+      const nowMs = performance.now();
+      const smoothedTip = { x: tipFilterX.filter(rawTip.x, nowMs), y: tipFilterY.filter(rawTip.y, nowMs) };
+      if (previewDot) {
+        previewDot.visible = true;
+        previewDot.material.color.set(slicingPose ? 0x3ddc84 : 0xff3b4e);
+        previewDot.position.set((smoothedTip.x - 0.5) * 110, -(smoothedTip.y - 0.5) * 80, 0.1);
+      }
+
+      handPresent = true;
+      const rawP = landmarkToWorld(smoothedTip.x, smoothedTip.y); // filtered, not raw
+      if (slicingPose && lastRawPoint && handSlicing) {
+        const dt = Math.max(nowMs - lastRawTime, 1);
+        handVX += ((rawP.x - lastRawPoint.x) / dt - handVX) * 0.5;
+        handVY += ((rawP.y - lastRawPoint.y) / dt - handVY) * 0.5;
+      } else {
+        handVX = 0; handVY = 0;
+      }
+      lastRawPoint = rawP;
+      lastRawTime = nowMs;
+      handSlicing = slicingPose;
+    } else if (handSlicing && ++lostFrames <= POSE_GRACE_FRAMES) {
+      // brief tracking dropout: keep coasting on the last motion instead of cutting the trail
+    } else {
+      if (previewDot) previewDot.visible = false;
+      tipFilterX.reset(); tipFilterY.reset();
+      handPresent = false; handSlicing = false; lastRawPoint = null;
+      handVX = 0; handVY = 0;
+      poseMiss = 0; lostFrames = 0;
+    }
+
+    if (running && awaitingCamera) { awaitingCamera = false; hideHandStatus(); lastTime = performance.now(); }
+    if (!running) return;
+    if (!handPresent) { showHandStatus('SHOW YOUR HAND TO THE CAMERA'); return; }
+    if (handSlicing) hideHandStatus();
+    else showHandStatus('FOLD THE OTHER FINGERS - POINT WITH YOUR INDEX FINGER TO SLICE');
+  }
+
+  // While the camera + model come up, the round is held (no timer, no waves) behind a visible message.
+  let awaitingCamera = false, awaitStart = 0;
+  const CAMERA_TIMEOUT_MS = 12000;
+  let handsInit = null;
+
+  function ensureHands() {
+    if (hands || typeof Hands === 'undefined') return;
+    hands = new Hands({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}` });
+    hands.setOptions({ maxNumHands: 1, modelComplexity: 0, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+    hands.onResults(onHandResults);
+  }
+  // Load the tracker's WASM + model while the player is still on the menu, so Start doesn't stall.
+  function warmUpHands() {
+    try {
+      ensureHands();
+      if (hands && !handsInit && hands.initialize) handsInit = Promise.resolve(hands.initialize()).catch(() => {});
+    } catch (err) { console.warn('hand tracker warm-up failed', err); }
+  }
+  function beginCameraStart() {
+    awaitingCamera = true;
+    awaitStart = performance.now();
+    showHandStatus('STARTING CAMERA...');
+    // let the game screen paint first; the heavy camera/model setup runs after it
+    setTimeout(() => { if (running) initHandTracking(); }, 30);
+  }
+
+  function initHandTracking() {
+    if (typeof Hands === 'undefined' || typeof Camera === 'undefined') {
+      awaitingCamera = false;
+      showHandStatus('HAND TRACKING UNAVAILABLE - USE TOUCH INSTEAD');
+      return;
+    }
+    ensureHands();
+    if (!cameraHelper) {
+      cameraHelper = new Camera(inputVideo, { onFrame: async () => { await hands.send({ image: inputVideo }); }, width: 480, height: 360 });
+    }
+    previewOn = true;
+    syncOverlays();
+    cameraHelper.start().catch(() => {
+      awaitingCamera = false;
+      previewOn = false;
+      syncOverlays();
+      showHandStatus('CAMERA UNAVAILABLE - USE TOUCH INSTEAD');
+    });
+  }
+
+  function stopCamera() {
+    awaitingCamera = false;
+    if (cameraHelper) { try { cameraHelper.stop(); } catch (err) {} }
+    if (inputVideo.srcObject) {
+      inputVideo.srcObject.getTracks().forEach(t => t.stop());
+      inputVideo.srcObject = null;
+    }
+    previewOn = false;
+    if (previewDot) previewDot.visible = false;
+    hideHandStatus();
+  }
+
+  function resetHandState() {
+    handDown = false;
+    smoothPt = null;
+    handSlicing = false; handPresent = false; lastRawPoint = null; handVX = 0; handVY = 0;
+    poseMiss = 0; lostFrames = 0;
+    tipFilterX.reset();
+    tipFilterY.reset();
+    trail = [];
+    hideTrail();
+  }
+
+  // ---- per-frame game update: split into stages so one failing stage can't freeze the rest ----
+  const DEBUG = /[?&]debug\b/.test((window.location && window.location.search) || '');
+  let lastErr = '';
+  function safe(stage, fn) {
+    try { return fn(); }
+    catch (err) {
+      console.error('[slice-ninja:' + stage + ']', err);
+      lastErr = stage + ': ' + (err && err.message ? err.message : String(err));
+    }
+  }
+
+  let lastTime = performance.now();
+
+  function stepHand(now) {
+    // hand-tracking slice check, extrapolated to render-frame rate
+    if (handSlicing && lastRawPoint) {
+      const elapsed = Math.max(0, Math.min(now - lastRawTime, MAX_EXTRAPOLATE_MS));
+      let ep = { x: lastRawPoint.x + handVX * elapsed, y: lastRawPoint.y + handVY * elapsed };
+      ep.x = Math.max(-visibleWidthAtZ0 / 2, Math.min(visibleWidthAtZ0 / 2, ep.x));
+      ep.y = Math.max(-visibleHeight / 2, Math.min(visibleHeight / 2, ep.y));
+      // ease the on-screen cursor toward the extrapolated point so 30fps camera updates don't step
+      if (!handDown || !smoothPt) smoothPt = { x: ep.x, y: ep.y };
+      else { smoothPt.x += (ep.x - smoothPt.x) * RENDER_FOLLOW; smoothPt.y += (ep.y - smoothPt.y) * RENDER_FOLLOW; }
+      ep = { x: smoothPt.x, y: smoothPt.y };
+      if (!handDown) { trail = [ep]; checkSlices(ep, ep); }
+      else {
+        const prev = trail[trail.length - 1] || ep;
+        trail.push(ep);
+        if (trail.length > 18) trail.shift();
+        checkSlices(prev, ep);
+      }
+      handDown = true;
+    } else if (handDown) {
+      handDown = false;
+      smoothPt = null;
+      trail = [];
+    }
+  }
+
+  // returns false when the round just ended
+  function stepClock(dt) {
+    timeScale += (1 - timeScale) * 0.05;
+    if (Math.abs(1 - timeScale) < 0.01) timeScale = 1;
+
+    waveTimer += dt * timeScale;
+    if (waveTimer >= WAVE_INTERVAL) { waveTimer = 0; spawnWave(); }
+    hud.waveFill.scale.x = Math.max(0.0001, 1 - waveTimer / WAVE_INTERVAL);
+
+    timeRemaining -= dt * timeScale;
+    if (timeRemaining <= 0) {
+      timeRemaining = 0;
+      hud.timeValue.set('0');
+      finishGame();
+      return false;
+    }
+    const secs = Math.ceil(timeRemaining / 1000);
+    if (secs !== lastSecsShown) { lastSecsShown = secs; hud.timeValue.set(String(secs)); }
+    return true;
+  }
+
+  function stepObjects() {
+    objects.forEach(o => {
+      if (!o.alive) { removeMesh(o); return; }
+      o.x += o.vx * timeScale;
+      o.y += o.vy * timeScale;
+      o.vy -= o.gravity * timeScale;
+      o.rot += o.vrot * timeScale;
+      if (o.y + o.r < -visibleHeight / 2 - 40 * WORLD_SCALE) { o.alive = false; removeMesh(o); return; }
+
+      const mesh = getOrCreateMesh(o);
+      mesh.position.set(o.x, o.y, 0);
+      mesh.rotation.z = o.rot;
+      if (o.isPiece) updatePieceClip(o, mesh);
+    });
+    objects = objects.filter(o => o.alive);
+  }
+
+  function stepParticles() {
+    particles.forEach(p => {
+      p.x += (p.vx || 0) * timeScale;
+      p.y += (p.vy || 0) * timeScale;
+      if (p.kind === 'spark' || p.kind === 'chunk') p.vy -= 0.08 * timeScale * WORLD_SCALE;
+      p.life -= p.decay;
+      p.sprite.position.set(p.x, p.y, p.sprite.position.z);
+      if (p.grow) {
+        const scale = p.baseScale + (1 - p.life) * p.growAmount;
+        p.sprite.scale.set(scale, scale, 1);
+      }
+      p.sprite.material.opacity = Math.max(0, p.life);
+    });
+    particles = particles.filter(p => {
+      if (p.life <= 0) { disposeParticle(p); return false; }
+      return true;
+    });
+  }
+
+  function stepEffects(now) {
+    flashMesh.material.opacity = flashAlpha;
+    if (flashAlpha > 0.002) flashAlpha *= 0.9; else flashAlpha = 0;
+    updateTrailMesh(now);
+  }
+
+  function update(now, dt) {
+    if (awaitingCamera) {
+      if (performance.now() - awaitStart > CAMERA_TIMEOUT_MS) {
+        awaitingCamera = false;
+        showHandStatus('CAMERA NOT READY - USE TOUCH INSTEAD');
+      }
+      return;
+    }
+    safe('hand', () => stepHand(now));
+    if (safe('clock', () => stepClock(dt)) === false) return;
+    safe('objects', stepObjects);
+    safe('particles', stepParticles);
+    safe('effects', () => stepEffects(now));
+  }
+
+  // ---- main loop: always running so the three.js menus stay live ----
+  let fpsFrames = 0, fpsStart = 0;
+  function frame(now) {
+    requestAnimationFrame(frame);
+    const dt = Math.min(now - lastTime, 100);
+    lastTime = now;
+    if (running) update(now, dt);
+
+    safe('render', () => {
+      renderer.clear();
+      renderer.render(scene, camera);
+      renderer.clearDepth();
+      renderer.render(hudScene, hudCamera);
+    });
+
+    if (DEBUG && hud.debug) {
+      fpsFrames++;
+      if (now - fpsStart >= 500) {
+        const fps = Math.round((fpsFrames * 1000) / (now - fpsStart));
+        fpsFrames = 0; fpsStart = now;
+        hud.debug.set('FPS ' + fps + (lastErr ? '  ' + lastErr.slice(0, 80) : ''), W - 40);
+      }
+    }
+  }
+
+  // ---- game flow ----
+  function startGame() {
+    ensureAudio();
+    paused = false;
+    score = 0;
+    setScore(0);
+    clearAllMeshes();
+    particles.forEach(disposeParticle);
+    objects = [];
+    particles = [];
+    resetHandState();
+    timeScale = 1;
+    flashAlpha = 0;
+    waveTimer = WAVE_INTERVAL;
+    timeRemaining = ROUND_SECONDS * 1000;
+    lastSecsShown = ROUND_SECONDS;
+    hud.timeValue.set(String(ROUND_SECONDS));
+    setWaveStatus('GET READY...');
+    menu.finalGroup.visible = false;
+    layoutMenu();
+    running = true;
+    lastTime = performance.now();
+    syncOverlays();
+    startMusic();
+    beginCameraStart();
+  }
+
+  function pauseGame() {
+    if (!running) return;
+    running = false;
+    paused = true;
+    stopMusic();
+    resetHandState();
+    stopCamera();
+    pause.scoreValue.set(String(score));
+    syncOverlays();
+  }
+
+  function resumeGame() {
+    paused = false;
+    running = true;
+    lastTime = performance.now();
+    syncOverlays();
+    startMusic();
+    beginCameraStart();
+  }
+
+  function finishGame() {
+    running = false;
+    paused = false;
+    stopMusic();
+    resetHandState();
+    stopCamera();
+    menu.finalValue.set(String(score));
+    menu.finalGroup.visible = true;
+    layoutMenu();
+    syncOverlays();
+  }
+
+  // ---- startup: run last, after every let/const above has been declared ----
+  resize();
+  initThree();
+  setTimeout(resize, 50);
+  setTimeout(resize, 300);
+  setTimeout(warmUpHands, 500);
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
